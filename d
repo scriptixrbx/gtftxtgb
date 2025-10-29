@@ -1,165 +1,219 @@
--- MM2 Auto Trade Script with SupremeValues Integration
--- By Grok (for educational purposes only)
--- Требует HttpService или syn.request (для executors)
+-- MM2 Auto Trade Script v2 - Full Automation with SupremeValues (2025 Update)
+-- By Grok (educational only - use at own risk)
+-- Требует executor с syn.request или HttpService
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
-local TweenService = game:GetService("TweenService")
-local StarterGui = game:GetService("StarterGui")
-
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
 -- Настройки
 local AUTO_TRADE_ENABLED = false
-local MONITOR_INTERVAL = 30 -- Секунды между проверками цен
-local PRICE_CHANGE_THRESHOLD = 0.05 -- 5% изменение для сигнала
-local itemsToMonitor = { -- Добавь предметы здесь (имена из MM2)
-    "Fire Tiger",
-    "Brush Knife",
-    "Fang Blade"
-}
-local priceHistory = {} -- Хранение истории: {item = {prices = {}, times = {}}}
+local AUTO_ADD_ENABLED = false
+local AUTO_ADD_ITEM = "Fire Tiger" -- Предмет для авто-добавления (измени на свой)
+local MONITOR_INTERVAL = 30 -- Секунды для цен
+local TRADE_CHECK_INTERVAL = 2 -- Секунды для проверки трейда
+local PRICE_CHANGE_THRESHOLD = 0.05 -- 5% для тренда
+local WIN_THRESHOLD = 1.1 -- Твоя ценность > их * 1.1 для "win"
+local itemsToMonitor = {"Fire Tiger", "Brush Knife", "Fang Blade"} -- Мониторь эти
+local priceHistory = {}
 
--- Функция для fetch цен с supremevalues.com (адаптировано; endpoint может быть /api/items?type=godly)
+-- Fetch цен с supremevalues (актуальный API 2025)
 local function fetchItemValue(itemName)
     local success, response = pcall(function()
-        -- Для executors используй syn.request; для Roblox - HttpService:GetAsync
-        if syn then
-            local res = syn.request({
-                Url = "https://supremevalues.com/api/items?search=" .. HttpService:UrlEncode(itemName),
-                Method = "GET"
-            })
+        local url = "https://api.supremevalues.xyz/items?search=" .. HttpService:UrlEncode(itemName)
+        if syn and syn.request then
+            local res = syn.request({Url = url, Method = "GET"})
             if res.StatusCode == 200 then
                 local data = HttpService:JSONDecode(res.Body)
-                return data.value or data.price or 0 -- Адаптируй под структуру JSON (обычно {value: number})
+                return data[1] and data[1].value or 0 -- Структура: [{name, value, ...}]
             end
         else
-            -- Fallback для HttpService (включи в Studio)
-            local url = "https://supremevalues.com/api/items?search=" .. HttpService:UrlEncode(itemName)
+            -- Fallback (для Studio)
             local data = HttpService:JSONDecode(HttpService:GetAsync(url))
-            return data.value or 0
+            return data[1] and data[1].value or 0
         end
         return 0
     end)
-    if success then
-        return response
-    else
-        warn("Ошибка fetch: " .. tostring(response))
+    if not success then
+        warn("Fetch error: " .. tostring(response))
         return 0
     end
+    return response
 end
 
--- Функция для анализа тренда (рост/падение)
+-- Анализ тренда
 local function analyzeTrend(itemName)
-    if not priceHistory[itemName] or #priceHistory[itemName].prices < 2 then
-        local currentPrice = fetchItemValue(itemName)
-        if currentPrice > 0 then
-            priceHistory[itemName] = {prices = {currentPrice}, times = {tick()}}
-        end
-        return "stable" -- Нет данных для тренда
-    end
-    
-    local prices = priceHistory[itemName].prices
     local currentPrice = fetchItemValue(itemName)
-    table.insert(prices, 1, currentPrice) -- Добавляем новую цену в начало
-    if #prices > 10 then table.remove(prices) end -- Храним последние 10
-    
-    local oldPrice = prices[#prices]
-    local change = (currentPrice - oldPrice) / oldPrice
-    
-    if change > PRICE_CHANGE_THRESHOLD then
-        return "rising" -- Растёт, стоит трейдить
-    elseif change < -PRICE_CHANGE_THRESHOLD then
-        return "falling" -- Падает, не трейдить
-    else
+    if not priceHistory[itemName] then
+        priceHistory[itemName] = {prices = {currentPrice}}
         return "stable"
     end
+    local prices = priceHistory[itemName].prices
+    table.insert(prices, 1, currentPrice)
+    if #prices > 10 then table.remove(prices) end
+    
+    local oldPrice = prices[#prices]
+    if oldPrice == 0 then return "stable" end
+    local change = (currentPrice - oldPrice) / oldPrice
+    
+    if change > PRICE_CHANGE_THRESHOLD then return "rising"
+    elseif change < -PRICE_CHANGE_THRESHOLD then return "falling"
+    else return "stable" end
 end
 
--- Функция для чата рекомендации (add/no)
-local function chatRecommendation(itemName, trend)
-    local message = ""
-    if trend == "rising" then
-        message = "add " .. itemName .. " (цена растёт!)"
-    elseif trend == "falling" then
-        message = "no " .. itemName .. " (цена падает!)"
-    else
-        message = "stable " .. itemName
+-- Чат
+local function chatMessage(msg)
+    ReplicatedStorage.DefaultChatSystemChatEvents.SayMessageRequest:FireServer(msg, "All")
+end
+
+-- Расчёт ценности стороны трейда (Left = твоя, Right = их)
+local function calculateTradeValue(sideFrame) -- sideFrame = LeftFrame.ScrollingFrame
+    local totalValue = 0
+    if not sideFrame then return 0 end
+    for _, child in pairs(sideFrame:GetChildren()) do
+        if child:IsA("Frame") and child:FindFirstChild("ItemName") then
+            local itemName = child.ItemName.Text
+            totalValue = totalValue + fetchItemValue(itemName)
+        end
     end
-    game:GetService("ReplicatedStorage").DefaultChatSystemChatEvents.SayMessageRequest:FireServer(message, "All")
+    return totalValue
 end
 
--- Симуляция авто-трейда (здесь логика для "win": сравни ценности в текущем трейде)
--- Предполагаем, что у тебя есть доступ к trade GUI; адаптируй под игру
-local function autoTradeLogic()
+-- Авто-логика трейда
+local function autoTradeCheck()
     if not AUTO_TRADE_ENABLED then return end
     
-    -- Пример: мониторим все предметы
-    for _, itemName in ipairs(itemsToMonitor) do
-        local trend = analyzeTrend(itemName)
-        chatRecommendation(itemName, trend)
-        
-        -- Логика "win": если тренд rising и твоя сторона выигрывает (пример расчёта)
-        -- В реальности: получи предметы из trade window via findFirstChild или RemoteEvents
-        local myTradeValue = 0 -- Рассчитай ценность твоих предметов
-        local theirTradeValue = 0 -- Их ценность
-        for item in myTradeItems do -- Псевдокод
-            myTradeValue += fetchItemValue(item.Name)
-        end
-        -- Аналогично для their
-        if trend == "rising" and myTradeValue > theirTradeValue * 1.1 then
-            -- Авто-accept (адаптируй: fire RemoteEvent для accept)
-            -- game.ReplicatedStorage.TradeRemote:FireServer("accept")
-            chatRecommendation("WIN TRADE!", "add")
-        else
-            chatRecommendation("NO WIN", "no")
+    local tradingFrame = playerGui:FindFirstChild("TradingFrame")
+    if not tradingFrame or not tradingFrame.Visible then return end
+    
+    -- Мониторь тренды и чать
+    for _, item in ipairs(itemsToMonitor) do
+        local trend = analyzeTrend(item)
+        local msg = trend == "rising" and "add " .. item .. " (рост!)" or (trend == "falling" and "no " .. item .. " (падение!)" or "stable " .. item)
+        chatMessage(msg)
+    end
+    
+    -- Расчёт win
+    local leftValue = calculateTradeValue(tradingFrame.LeftFrame and tradingFrame.LeftFrame.ScrollingFrame)
+    local rightValue = calculateTradeValue(tradingFrame.RightFrame and tradingFrame.RightFrame.ScrollingFrame)
+    
+    local isWin = leftValue > rightValue * WIN_THRESHOLD
+    local acceptBtn = tradingFrame:FindFirstChild("AcceptButton") or tradingFrame:FindFirstChildOfClass("TextButton") -- Адаптируй если имя другое
+    local declineBtn = tradingFrame:FindFirstChild("DeclineButton") or tradingFrame:FindFirstChildOfClass("TextButton", true) -- Decline
+    
+    if isWin then
+        if acceptBtn then acceptBtn.MouseButton1Click:Fire() end
+        chatMessage("add WIN TRADE! (твоя ценность: " .. leftValue .. ", их: " .. rightValue .. ")")
+    else
+        if declineBtn then declineBtn.MouseButton1Click:Fire() end
+        chatMessage("no LOSE TRADE! (твоя: " .. leftValue .. ", их: " .. rightValue .. ")")
+    end
+end
+
+-- Авто-добавление предмета (клик по инвентарю)
+local function autoAddItemToTrade()
+    if not AUTO_ADD_ENABLED or not AUTO_TRADE_ENABLED then return end
+    local tradingFrame = playerGui:FindFirstChild("TradingFrame")
+    if not tradingFrame or not tradingFrame.Visible then return end
+    
+    local trend = analyzeTrend(AUTO_ADD_ITEM)
+    if trend == "rising" then
+        -- Найди кнопку предмета в инвентаре (предполагаем в Backpack GUI или Trade Add buttons)
+        local backpack = player:FindFirstChild("Backpack")
+        if backpack then
+            for _, tool in pairs(backpack:GetChildren()) do
+                if tool.Name == AUTO_ADD_ITEM then
+                    -- Симулируем клик (fire event или mouse)
+                    tool.MouseButton1Click:Fire() -- Если это button; иначе используй firesignal
+                    chatMessage("add " .. AUTO_ADD_ITEM .. " to trade!")
+                    break
+                end
+            end
         end
     end
 end
 
--- GUI для toggle
+-- Основной loop для трейда
+spawn(function()
+    while true do
+        wait(TRADE_CHECK_INTERVAL)
+        autoTradeCheck()
+        autoAddItemToTrade()
+    end
+end)
+
+-- Loop для мониторинга цен (фон)
+spawn(function()
+    while true do
+        wait(MONITOR_INTERVAL)
+        for _, item in ipairs(itemsToMonitor) do
+            analyzeTrend(item) -- Обновляем историю
+        end
+    end
+end)
+
+-- GUI
 local function createGUI()
     local screenGui = Instance.new("ScreenGui")
     screenGui.Name = "AutoTradeGUI"
     screenGui.Parent = playerGui
     
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 200, 0, 100)
+    frame.Size = UDim2.new(0, 250, 0, 150)
     frame.Position = UDim2.new(0, 10, 0, 10)
     frame.BackgroundColor3 = Color3.new(0, 0, 0)
     frame.Parent = screenGui
     
-    local toggleButton = Instance.new("TextButton")
-    toggleButton.Size = UDim2.new(1, 0, 0.5, 0)
-    toggleButton.Position = UDim2.new(0, 0, 0, 0)
-    toggleButton.Text = "Auto Trade: OFF"
-    toggleButton.BackgroundColor3 = Color3.new(1, 0, 0)
-    toggleButton.Parent = frame
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 30)
+    title.Text = "MM2 Auto Trade v2"
+    title.BackgroundTransparency = 1
+    title.TextColor3 = Color3.new(1, 1, 1)
+    title.Parent = frame
     
-    local statusLabel = Instance.new("TextLabel")
-    statusLabel.Size = UDim2.new(1, 0, 0.5, 0)
-    statusLabel.Position = UDim2.new(0, 0, 0.5, 0)
-    statusLabel.Text = "Мониторинг: Запуск..."
-    statusLabel.BackgroundTransparency = 1
-    statusLabel.TextColor3 = Color3.new(1, 1, 1)
-    statusLabel.Parent = frame
-    
-    toggleButton.MouseButton1Click:Connect(function()
+    local toggleTrade = Instance.new("TextButton")
+    toggleTrade.Size = UDim2.new(1, 0, 0, 30)
+    toggleTrade.Position = UDim2.new(0, 0, 0, 30)
+    toggleTrade.Text = "Auto Trade: OFF"
+    toggleTrade.BackgroundColor3 = Color3.new(1, 0, 0)
+    toggleTrade.Parent = frame
+    toggleTrade.MouseButton1Click:Connect(function()
         AUTO_TRADE_ENABLED = not AUTO_TRADE_ENABLED
-        toggleButton.Text = "Auto Trade: " .. (AUTO_TRADE_ENABLED and "ON" or "OFF")
-        toggleButton.BackgroundColor3 = AUTO_TRADE_ENABLED and Color3.new(0, 1, 0) or Color3.new(1, 0, 0)
-        statusLabel.Text = AUTO_TRADE_ENABLED and "Авто-трейд включён" or "Авто-трейд выключён"
+        toggleTrade.Text = "Auto Trade: " .. (AUTO_TRADE_ENABLED and "ON" or "OFF")
+        toggleTrade.BackgroundColor3 = AUTO_TRADE_ENABLED and Color3.new(0, 1, 0) or Color3.new(1, 0, 0)
+    end)
+    
+    local toggleAdd = Instance.new("TextButton")
+    toggleAdd.Size = UDim2.new(1, 0, 0, 30)
+    toggleAdd.Position = UDim2.new(0, 0, 0, 60)
+    toggleAdd.Text = "Auto Add Item: OFF (" .. AUTO_ADD_ITEM .. ")"
+    toggleAdd.BackgroundColor3 = Color3.new(1, 0, 0)
+    toggleAdd.Parent = frame
+    toggleAdd.MouseButton1Click:Connect(function()
+        AUTO_ADD_ENABLED = not AUTO_ADD_ENABLED
+        toggleAdd.Text = "Auto Add Item: " .. (AUTO_ADD_ENABLED and "ON" or "OFF") .. " (" .. AUTO_ADD_ITEM .. ")"
+        toggleAdd.BackgroundColor3 = AUTO_ADD_ENABLED and Color3.new(0, 1, 0) or Color3.new(1, 0, 0)
+    end)
+    
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, 0, 0, 30)
+    status.Position = UDim2.new(0, 0, 0, 90)
+    status.Text = "Статус: Готов"
+    status.BackgroundTransparency = 1
+    status.TextColor3 = Color3.new(1, 1, 1)
+    status.Parent = frame
+    
+    -- Обновление статуса (пример)
+    spawn(function()
+        while true do
+            wait(5)
+            status.Text = "Тренды обновлены. Трейд: " .. (AUTO_TRADE_ENABLED and "ON" or "OFF")
+        end
     end)
 end
 
--- Основной loop
-spawn(function()
-    createGUI()
-    while true do
-        wait(MONITOR_INTERVAL)
-        autoTradeLogic()
-    end
-end)
-
-print("Скрипт загружен! Нажми кнопку в GUI для toggle.")
+createGUI()
+print("Скрипт v2 загружен! Включи в GUI, открой трейд для теста.")
